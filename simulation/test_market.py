@@ -442,3 +442,137 @@ def test_uniform_pricing_with_nothing_to_clear_has_no_price():
 def test_an_unknown_pricing_rule_is_rejected():
     with pytest.raises(ValueError, match="sealed_bid"):
         clear_tick(tick=TICK, timestamp=TIMESTAMP, orders=[], pricing="sealed_bid")
+
+
+# ---------------------------------------------------------------------------
+# Feeder capacity
+# ---------------------------------------------------------------------------
+
+def test_an_uncapped_feeder_is_the_default():
+    """Existing callers see no change: no cap set means no cap applied."""
+    default = clear_tick(tick=TICK, timestamp=TIMESTAMP, orders=_two_buyers_one_seller())
+    uncapped = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=_two_buyers_one_seller(),
+        feeder_capacity_kwh=None,
+    )
+
+    assert default == uncapped
+
+
+def test_a_feeder_cap_keeps_the_best_priced_trades_and_curtails_the_rest():
+    """Hand-calculated. The book clears 1.5 kWh uncapped; the feeder carries 1.2.
+
+    hh_high (0.22) outbids hh_low (0.14), so the whole 1.0 kWh hh_high wanted trades
+    first, at the midpoint (0.22 + 0.10) / 2 = 0.16. That leaves 0.2 kWh of feeder
+    for hh_low, which trades at (0.14 + 0.10) / 2 = 0.12. The 0.8 kWh hh_low could
+    not get comes back unmatched, and so does the 0.3 kWh the seller could not ship.
+    """
+    state = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=_two_buyers_one_seller(),
+        feeder_capacity_kwh=1.2,
+    )
+
+    assert [(t.buyer_id, t.quantity_kwh) for t in state.trades] == [
+        ("hh_high", 1.0),
+        ("hh_low", pytest.approx(0.2)),
+    ]
+    assert [t.clearing_price_eur_per_kwh for t in state.trades] == pytest.approx([0.16, 0.12])
+    assert sum(t.quantity_kwh for t in state.trades) == pytest.approx(1.2)
+
+    assert [(o.household_id, o.quantity_kwh) for o in state.unmatched_buy_orders] == [
+        ("hh_low", pytest.approx(0.8))
+    ]
+    assert [(o.household_id, o.quantity_kwh) for o in state.unmatched_sell_orders] == [
+        ("hh_seller", pytest.approx(0.3))
+    ]
+
+
+def test_a_capped_feeder_curtails_tied_orders_pro_rata():
+    """Two identical buyers, 2.0 kWh on offer, a feeder that carries 1.0.
+
+    Both buyers bid 0.20, so they are one price level and share the scarce feeder in
+    proportion to their size: 0.5 kWh each, not 1.0 for whoever the caller listed
+    first. Scarcity must not reintroduce the list-position advantage the pro-rata
+    tie rule removed.
+    """
+    state = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=[
+            order("hh_a", OrderSide.BUY, quantity_kwh=1.0, limit_price_eur_per_kwh=0.20),
+            order("hh_b", OrderSide.BUY, quantity_kwh=1.0, limit_price_eur_per_kwh=0.20),
+            order("hh_sell", OrderSide.SELL, quantity_kwh=2.0, limit_price_eur_per_kwh=0.10),
+        ],
+        feeder_capacity_kwh=1.0,
+    )
+
+    traded = {t.buyer_id: t.quantity_kwh for t in state.trades}
+    assert traded == {"hh_a": pytest.approx(0.5), "hh_b": pytest.approx(0.5)}
+    assert {o.household_id: o.quantity_kwh for o in state.unmatched_buy_orders} == {
+        "hh_a": pytest.approx(0.5),
+        "hh_b": pytest.approx(0.5),
+    }
+
+
+def test_a_feeder_with_no_capacity_clears_nothing():
+    """A cap of zero is an outage: the book crosses, and still nothing may ship."""
+    state = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=_two_buyers_one_seller(),
+        feeder_capacity_kwh=0.0,
+    )
+
+    assert state.trades == []
+    assert state.clearing_price_eur_per_kwh is None
+    assert {o.household_id: o.quantity_kwh for o in state.unmatched_buy_orders} == {
+        "hh_low": 1.0,
+        "hh_high": 1.0,
+    }
+    assert [o.quantity_kwh for o in state.unmatched_sell_orders] == [1.5]
+
+
+def test_a_cap_above_what_the_book_wants_changes_nothing():
+    """The constraint only bites when the community actually fills the feeder."""
+    uncapped = clear_tick(tick=TICK, timestamp=TIMESTAMP, orders=_two_buyers_one_seller())
+    generous = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=_two_buyers_one_seller(),
+        feeder_capacity_kwh=100.0,
+    )
+
+    assert generous == uncapped
+
+
+def test_uniform_pricing_prices_a_capped_tick_at_its_marginal_trade():
+    """Under a cap the marginal pair is the last one the feeder had room for.
+
+    hh_high fills first, then 0.2 kWh of hh_low, so the marginal pair is hh_low
+    (0.14) with the seller (0.10) and the tick's one price is 0.12 — the price of
+    the last kWh that could physically ship.
+    """
+    state = clear_tick(
+        tick=TICK,
+        timestamp=TIMESTAMP,
+        orders=_two_buyers_one_seller(),
+        pricing=PricingRule.UNIFORM,
+        feeder_capacity_kwh=1.2,
+    )
+
+    assert len({t.clearing_price_eur_per_kwh for t in state.trades}) == 1
+    assert state.clearing_price_eur_per_kwh == pytest.approx(0.12)
+
+
+def test_a_negative_feeder_capacity_is_rejected():
+    with pytest.raises(ValueError, match="feeder_capacity_kwh"):
+        clear_tick(
+            tick=TICK,
+            timestamp=TIMESTAMP,
+            orders=_two_buyers_one_seller(),
+            feeder_capacity_kwh=-1.0,
+        )

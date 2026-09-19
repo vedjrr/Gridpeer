@@ -213,3 +213,103 @@ def test_honest_trading_inside_the_tariff_gap_never_loses_money(book, pricing):
 
     for settlement in settlements.values():
         assert settlement.savings_eur >= -TOLERANCE
+
+
+feeder_capacities = st.floats(min_value=0.0, max_value=40.0, allow_nan=False)
+
+
+@given(book=order_books(), pricing=pricing_rules, capacity_kwh=feeder_capacities)
+def test_a_capped_feeder_is_never_overloaded(book, pricing, capacity_kwh):
+    """No book can push more energy across the feeder than it can carry."""
+    state = clear_tick(TICK, TIMESTAMP, book, pricing=pricing, feeder_capacity_kwh=capacity_kwh)
+
+    assert sum(trade.quantity_kwh for trade in state.trades) <= capacity_kwh + TOLERANCE
+
+
+@given(book=order_books(), pricing=pricing_rules, capacity_kwh=feeder_capacities)
+def test_curtailed_energy_comes_back_as_unmatched_orders(book, pricing, capacity_kwh):
+    """A cap moves energy from trades to the grid fallback; it never destroys it."""
+    state = clear_tick(TICK, TIMESTAMP, book, pricing=pricing, feeder_capacity_kwh=capacity_kwh)
+    traded = traded_kwh_by_household(state)
+    unmatched = unmatched_kwh_by_household(state)
+
+    for order in book:
+        accounted = traded.get(order.household_id, 0.0) + unmatched.get(order.household_id, 0.0)
+        assert accounted == pytest.approx(order.quantity_kwh, abs=TOLERANCE)
+
+
+@given(
+    data=st.data(),
+    book=order_books(),
+    pricing=pricing_rules,
+    capacity_kwh=feeder_capacities,
+)
+def test_scarce_feeder_capacity_is_shared_independently_of_book_order(
+    data, book, pricing, capacity_kwh
+):
+    """Who loses out to a full feeder must not depend on who the caller listed first.
+
+    This is the pro-rata rule under scarcity. A cap makes ties bind far more often —
+    the feeder fills before the book does — so if list position ever leaked back in,
+    it would leak in here first.
+    """
+    shuffled = data.draw(st.permutations(book))
+
+    original = clear_tick(
+        TICK, TIMESTAMP, book, pricing=pricing, feeder_capacity_kwh=capacity_kwh
+    )
+    reordered = clear_tick(
+        TICK, TIMESTAMP, shuffled, pricing=pricing, feeder_capacity_kwh=capacity_kwh
+    )
+
+    assert original.trades == reordered.trades
+    assert unmatched_kwh_by_household(original) == unmatched_kwh_by_household(reordered)
+
+
+@given(book=order_books(), pricing=pricing_rules, capacity_kwh=feeder_capacities)
+def test_a_cap_only_ever_removes_trades(book, pricing, capacity_kwh):
+    """Constraining the feeder can never make the community trade more."""
+    uncapped = clear_tick(TICK, TIMESTAMP, book, pricing=pricing)
+    capped = clear_tick(TICK, TIMESTAMP, book, pricing=pricing, feeder_capacity_kwh=capacity_kwh)
+
+    uncapped_kwh = sum(trade.quantity_kwh for trade in uncapped.trades)
+    capped_kwh = sum(trade.quantity_kwh for trade in capped.trades)
+    assert capped_kwh <= uncapped_kwh + TOLERANCE
+
+
+@given(
+    book=order_books(prices=TARIFF_GAP_PRICES),
+    pricing=pricing_rules,
+    capacity_kwh=feeder_capacities,
+)
+def test_a_capped_feeder_still_never_loses_an_honest_household_money(book, pricing, capacity_kwh):
+    """Curtailed energy falls back to the grid, which saves nothing — but costs nothing.
+
+    Same setup as the uncapped version: every meter reads exactly what its household
+    ordered. If a curtailed order could leave a household worse off than never
+    trading, the savings figure would depend on the feeder being infinite.
+    """
+    state = clear_tick(TICK, TIMESTAMP, book, pricing=pricing, feeder_capacity_kwh=capacity_kwh)
+    profiles = {
+        order.household_id: HouseholdProfile(
+            household_id=order.household_id,
+            role=AgentRole.PROSUMER,
+            has_solar=True,
+            solar_capacity_kw=3.0,
+            battery_capacity_kwh=0.0,
+            grid_export_tariff_eur_per_kwh=EXPORT_TARIFF,
+            grid_import_tariff_eur_per_kwh=IMPORT_TARIFF,
+        )
+        for order in book
+    }
+    metered_kwh = {
+        order.household_id: (
+            order.quantity_kwh if order.side is OrderSide.SELL else -order.quantity_kwh
+        )
+        for order in book
+    }
+
+    settlements = settle_tick(state, profiles, actual_net_position_kwh=metered_kwh)
+
+    for settlement in settlements.values():
+        assert settlement.savings_eur >= -TOLERANCE

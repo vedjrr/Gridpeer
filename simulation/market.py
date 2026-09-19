@@ -20,6 +20,12 @@ their two totals, and the side with more on offer shares that volume **pro-rata*
 each order fills in proportion to its size. When the best buy level no longer
 crosses the best sell level, nothing further can trade and the rest is unmatched.
 
+The feeder: a community shares one physical connection, and every peer-to-peer kWh
+runs over it. ``feeder_capacity_kwh`` caps what a tick may trade across it. Matching
+already runs best levels first, so a constrained tick keeps the trades the book
+valued most and curtails the marginal level pro-rata; curtailed energy returns as
+unmatched orders and settles at grid tariffs. Without a cap set, nothing changes.
+
 Why pro-rata rather than first-come-first-served: all of a tick's orders arrive
 together, so the only "first" available is an order's position in the input list —
 which is an accident of how the caller happened to loop over households. Ranking by
@@ -176,17 +182,26 @@ def _pro_rata_kwh(level: list[_Entry], open_kwh: float, volume_kwh: float) -> li
     return [entry.remaining_kwh * share for entry in level]
 
 
-def _match_levels(buys: list[_Entry], sells: list[_Entry]) -> list[_Match]:
+def _match_levels(
+    buys: list[_Entry], sells: list[_Entry], capacity_kwh: float | None = None
+) -> list[_Match]:
     """Trade two crossing price levels against each other, pro-rata within each.
 
     Each side's allocation is fixed first, then the two are paired off in
     household_id order. Pairing that way produces at most len(buys) + len(sells) - 1
     trades — never one per buyer-seller pair, which would be quadratic in a large
     community — while every household still gets exactly its pro-rata share.
+
+    ``capacity_kwh`` caps what these two levels may trade between them (see
+    ``clear_tick``). It shrinks the volume the levels share; the pro-rata split of
+    that volume is unchanged, so a constrained level curtails every order in it by
+    the same fraction.
     """
     open_buy_kwh = sum(entry.remaining_kwh for entry in buys)
     open_sell_kwh = sum(entry.remaining_kwh for entry in sells)
     volume_kwh = min(open_buy_kwh, open_sell_kwh)
+    if capacity_kwh is not None:
+        volume_kwh = min(volume_kwh, capacity_kwh)
     buy_allocation = _pro_rata_kwh(buys, open_buy_kwh, volume_kwh)
     sell_allocation = _pro_rata_kwh(sells, open_sell_kwh, volume_kwh)
 
@@ -214,14 +229,27 @@ def _match_levels(buys: list[_Entry], sells: list[_Entry]) -> list[_Match]:
     return matches
 
 
-def _match_book(buys: list[_Entry], sells: list[_Entry]) -> list[_Match]:
-    """Every match the book produces, best-priced levels first."""
+def _match_book(
+    buys: list[_Entry], sells: list[_Entry], feeder_capacity_kwh: float | None = None
+) -> list[_Match]:
+    """Every match the book produces, best-priced levels first.
+
+    ``feeder_capacity_kwh`` is a budget spent as the levels match. Because matching
+    runs from the best-priced levels down, the trades a constrained feeder keeps are
+    the ones the book valued most, and the marginal level is the one curtailed —
+    the same merit order a constrained market clears in.
+    """
     buy_levels = _price_levels(buys, highest_first=True)
     sell_levels = _price_levels(sells, highest_first=False)
 
+    remaining_capacity_kwh = feeder_capacity_kwh
     matches: list[_Match] = []
     b = s = 0
     while b < len(buy_levels) and s < len(sell_levels):
+        if remaining_capacity_kwh is not None and (
+            remaining_capacity_kwh <= QUANTITY_EPSILON_KWH
+        ):
+            break
         buy_level = [entry for entry in buy_levels[b] if not entry.filled]
         sell_level = [entry for entry in sell_levels[s] if not entry.filled]
         if not buy_level:
@@ -239,7 +267,15 @@ def _match_book(buys: list[_Entry], sells: list[_Entry]) -> list[_Match]:
         ):
             break
 
-        matches.extend(_match_levels(buy_level, sell_level))
+        level_matches = _match_levels(buy_level, sell_level, remaining_capacity_kwh)
+        matches.extend(level_matches)
+        if remaining_capacity_kwh is not None:
+            # No match means the capacity left is float dust that cannot pay for a
+            # trade. Stopping here is what makes the loop terminate: neither level
+            # was filled, so nothing else would advance it.
+            if not level_matches:
+                break
+            remaining_capacity_kwh -= sum(match.quantity_kwh for match in level_matches)
     return matches
 
 
@@ -248,6 +284,7 @@ def clear_tick(
     timestamp: datetime,
     orders: Sequence[AgentDecision],
     pricing: PricingRule = PricingRule.PAIRWISE_MIDPOINT,
+    feeder_capacity_kwh: float | None = None,
 ) -> MarketState:
     """Clear one tick's order book and return the resulting market state.
 
@@ -261,9 +298,18 @@ def clear_tick(
     is identical under every rule. ``MarketState.clearing_price_eur_per_kwh`` is the
     volume-weighted average price across the tick's trades — the one uniform price,
     under ``UNIFORM`` — or ``None`` when nothing cleared.
+
+    ``feeder_capacity_kwh`` is the most energy the community's shared feeder can
+    carry peer-to-peer in one tick; ``None`` (the default) is an unconstrained
+    feeder, which is every result in the repo so far. Trading stops once the cap is
+    reached, so the best-priced levels clear and the marginal level is curtailed
+    pro-rata. Curtailed energy is not lost: it comes back as unmatched orders and
+    settles at grid tariffs, exactly like energy the book never matched.
     """
     _validate(tick, orders)
     pricing = PricingRule(pricing)
+    if feeder_capacity_kwh is not None and feeder_capacity_kwh < 0:
+        raise ValueError("feeder_capacity_kwh must be >= 0")
 
     buys = [
         _Entry(index, order, order.quantity_kwh)
@@ -276,7 +322,7 @@ def clear_tick(
         if order.side is OrderSide.SELL
     ]
 
-    matches = _match_book(buys, sells)
+    matches = _match_book(buys, sells, feeder_capacity_kwh)
     uniform_price = (
         _uniform_price_eur_per_kwh(matches)
         if pricing is PricingRule.UNIFORM and matches

@@ -13,6 +13,7 @@ Market clearing mechanism (a double auction cleared once per tick — a *call* a
 - [x] `MarketSimulator.step()` — physics, clearing and settlement in one call
 - [x] Fair tie-breaking — tied orders share volume pro-rata, never by list position
 - [x] Two pricing rules — pairwise midpoint (default) and uniform price
+- [x] Feeder capacity limit — a shared connection the community can fill
 - [x] Property-based tests of the clearing and settlement invariants
 
 ## Running just this module
@@ -108,10 +109,35 @@ result in the repo. A neighbour-to-neighbour trade still runs over the distribut
 network, and the grid import tariff already carries those charges — so without this,
 P2P savings are optimistic. `reports/realism_study.md` shows how fast they shrink.
 
+## Feeder capacity
+
+Every peer-to-peer kWh runs over the community's shared connection, and that connection
+has a size. `clear_tick(..., feeder_capacity_kwh=...)` and
+`MarketSimulator(..., feeder_capacity_kwh_per_tick=...)` cap what one tick may trade
+across it. It defaults to `None` — an unconstrained feeder, which is every other result
+in the repo.
+
+The cap is a **rate**: kWh per half-hour tick, not per run. Each tick gets it in full.
+
+Matching already runs the best-priced levels first, so the cap is spent as a budget in
+that order: the trades the book valued most clear, and the marginal price level is the
+one curtailed. Within that level, curtailment is pro-rata, the same rule as a tie — a
+full feeder must not hand the first household in the caller's list the last kWh.
+
+**Curtailed energy is not lost.** It comes back as unmatched orders, so settlement sends
+it to the grid at that household's own tariffs. The physics happened either way; the
+constraint only decides whether the neighbour or the grid supplied it. That is why a
+capped tick saves less: with a feeder carrying a quarter of what the community wanted to
+trade, it keeps a quarter of the savings.
+
+Why it matters beyond realism: it is what makes the dashboard's peak-load reduction
+figure a physical claim rather than an accounting one, and it is the constraint the
+week-4 stress scenarios (EV surge, heatwave) need in order to bite.
+
 ## Clearing, in one paragraph
 
-`clear_tick(tick, timestamp, orders, pricing=...)` takes a tick's `AgentDecision` book and
-returns a `MarketState`. It is a **call auction**: every order for the half-hour arrives
+`clear_tick(tick, timestamp, orders, pricing=..., feeder_capacity_kwh=...)` takes a tick's
+`AgentDecision` book and returns a `MarketState`. It is a **call auction**: every order for the half-hour arrives
 together and the book is cleared once — not a continuous double auction, because there is
 no order flow within a tick. Buys are grouped into price levels from the highest limit
 down, sells from the lowest up, and the best levels trade while the buyers' maximum is at
@@ -132,7 +158,8 @@ was only the order the caller looped over households in — the first household 
 list won every tie, every tick, for a whole run. That mattered more than it sounds: the
 rule-based baseline gives identical households identical prices, so ties are the normal
 case. Pro-rata is the standard exchange rule for simultaneous orders, needs no seed, and
-books without ties clear exactly as before.
+books without ties clear exactly as before. The same rule curtails the marginal level
+when a feeder cap binds.
 
 ## Pricing rules: `PricingRule`
 
@@ -174,5 +201,8 @@ pricing rules, that no book can break these invariants: traded plus unmatched vo
 equals what each order offered; nobody trades outside their own limit; nothing that
 could still cross is left on the book; shuffling the book changes no trade; tied orders
 fill the same fraction; both rules agree on volume; and honest orders priced inside the
-tariff gap never lose money at the meter. 200 books per property run in CI; the
+tariff gap never lose money at the meter. Under a random feeder cap it also checks that
+the feeder is never overloaded, that curtailed energy returns as unmatched orders rather
+than vanishing, that a cap only ever removes trades, and that who loses out to a full
+feeder does not depend on book order. 200 books per property run in CI; the
 `thorough` profile runs 5,000.

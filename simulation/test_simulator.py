@@ -296,3 +296,59 @@ def test_the_simulator_passes_its_pricing_rule_to_the_market():
     # One pair, so the marginal midpoint and the pair's own midpoint coincide.
     assert uniform.market_state.clearing_price_eur_per_kwh == pytest.approx(0.15)
     assert uniform.savings_eur == pytest.approx(pairwise.savings_eur)
+
+
+def test_a_capped_feeder_sends_the_curtailed_energy_to_the_grid():
+    """Hand-calculated. The pair wants to trade 2.0 kWh; the feeder carries 0.5.
+
+    0.5 kWh clears at the 0.15 midpoint. The other 1.5 kWh is physics that still
+    happened — the producer generated it and the consumer used it — so it settles at
+    the grid: the buyer imports 1.5 at 0.25, the seller exports 1.5 at 0.07. Savings
+    fall to a quarter of the unconstrained tick's, which is the point of modelling
+    the feeder at all.
+    """
+    simulator = MarketSimulator(complementary_pair(), feeder_capacity_kwh_per_tick=0.5)
+
+    result = simulator.step(crossing_book(tick=0))
+
+    assert sum(t.quantity_kwh for t in result.market_state.trades) == pytest.approx(0.5)
+    assert result.market_state.clearing_price_eur_per_kwh == pytest.approx(0.15)
+
+    buyer = result.settlements["hh_buy"]
+    assert buyer.traded_kwh == pytest.approx(0.5)
+    assert buyer.grid_fallback_kwh == pytest.approx(1.5)
+    assert buyer.p2p_cost_eur == pytest.approx(0.5 * 0.15 + 1.5 * IMPORT_TARIFF)
+    assert buyer.grid_only_cost_eur == pytest.approx(2.0 * IMPORT_TARIFF)
+
+    seller = result.settlements["hh_sell"]
+    assert seller.p2p_cost_eur == pytest.approx(-(0.5 * 0.15) - 1.5 * EXPORT_TARIFF)
+
+    # Unconstrained, this tick saves 0.36 (see test_one_tick_end_to_end_by_hand).
+    assert result.savings_eur == pytest.approx(0.09)
+
+
+def test_an_unconstrained_feeder_is_the_default():
+    """Every existing result stands: without a cap, the simulator behaves as before."""
+    households = complementary_pair(ticks=2)
+
+    default = MarketSimulator(households).step(crossing_book(tick=0))
+    generous = MarketSimulator(households, feeder_capacity_kwh_per_tick=50.0).step(
+        crossing_book(tick=0)
+    )
+
+    assert default.market_state == generous.market_state
+    assert default.savings_eur == pytest.approx(generous.savings_eur)
+
+
+def test_the_feeder_cap_applies_every_tick_not_once_per_run():
+    """The constraint is a rate — kWh per half-hour — so each tick gets it in full."""
+    simulator = MarketSimulator(complementary_pair(ticks=3), feeder_capacity_kwh_per_tick=0.5)
+
+    for tick in range(3):
+        result = simulator.step(crossing_book(tick=tick))
+        assert sum(t.quantity_kwh for t in result.market_state.trades) == pytest.approx(0.5)
+
+
+def test_a_negative_feeder_capacity_is_rejected():
+    with pytest.raises(ValueError, match="feeder_capacity_kwh_per_tick"):
+        MarketSimulator(complementary_pair(), feeder_capacity_kwh_per_tick=-0.5)

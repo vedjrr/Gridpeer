@@ -67,7 +67,7 @@ Also settle now: **who has final say when two people disagree on a schema field.
 ## Week 4+ — Polish, and where "keep building for a month" pays off
 
 Pick based on appetite, don't try to do all of them:
-- [ ] Scenario simulator: heatwave, EV charging surge, grid outage — how does the market behave under stress?
+- [~] Scenario simulator: heatwave, EV charging surge, grid outage — how does the market behave under stress? The feeder capacity limit (`MarketSimulator(..., feeder_capacity_kwh_per_tick=...)`) is the constraint these scenarios need in order to bite; the demand/tariff events themselves are still to build.
 - [ ] Scale to more households, check the market mechanism still clears sensibly at scale
 - [ ] Dynamic pricing under grid-stress events
 - [ ] Real deployment — Streamlit Cloud or a small VPS, so it's a live link, not just a repo

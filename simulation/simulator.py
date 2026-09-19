@@ -103,6 +103,7 @@ class MarketSimulator:
         max_battery_power_kw: float | None = None,
         network_charge_eur_per_kwh: float = 0.0,
         pricing: PricingRule = PricingRule.PAIRWISE_MIDPOINT,
+        feeder_capacity_kwh_per_tick: float | None = None,
     ) -> None:
         """households: the community, each with its own profile and series.
 
@@ -112,13 +113,19 @@ class MarketSimulator:
         network_charge_eur_per_kwh: levied on each P2P kWh, paid by the buyer (see
         ``settle_tick``); zero by default. pricing: how matched energy is priced,
         pairwise midpoint by default or one uniform price per tick (see ``PricingRule``).
+        feeder_capacity_kwh_per_tick: the most the community may trade peer-to-peer in
+        one tick, None for an unconstrained feeder (the default); energy over the cap
+        falls back to the grid (see ``clear_tick``).
         """
         if not households:
             raise ValueError("a simulator needs at least one household")
+        if feeder_capacity_kwh_per_tick is not None and feeder_capacity_kwh_per_tick < 0:
+            raise ValueError("feeder_capacity_kwh_per_tick must be >= 0")
 
         self.epoch = epoch
         self.network_charge_eur_per_kwh = network_charge_eur_per_kwh
         self.pricing = PricingRule(pricing)
+        self.feeder_capacity_kwh_per_tick = feeder_capacity_kwh_per_tick
         self.profiles: dict[str, HouseholdProfile] = {}
         self.environments: dict[str, HouseholdEnvironment] = {}
 
@@ -195,7 +202,11 @@ class MarketSimulator:
         }
 
         market_state = clear_tick(
-            tick=tick, timestamp=timestamp, orders=orders, pricing=self.pricing
+            tick=tick,
+            timestamp=timestamp,
+            orders=orders,
+            pricing=self.pricing,
+            feeder_capacity_kwh=self.feeder_capacity_kwh_per_tick,
         )
         settlements = settle_tick(
             market_state,
