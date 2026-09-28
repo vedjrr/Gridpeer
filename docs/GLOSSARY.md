@@ -6,3 +6,4 @@ Short definitions of terms used across GridPeer.
 - **Household (agent)** — a home with solar, battery and variable demand.
 - **Double auction** — market where buyers and sellers submit bids and asks; trades clear at a matched price.
 - **Feed-in tariff (€/kWh)** — price the grid pays for exported surplus energy; the baseline P2P trading must beat.
+- **Peak load (kW)** — highest aggregate demand on the grid in a period; a key metric for comparing agents.
