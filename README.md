@@ -90,6 +90,10 @@ See `CLAUDE.md` for how AI coding assistants should work in this repo, and `ROAD
 
 Fill this in once roles are picked — see the "Deciding roles" section of `ROADMAP.md`.
 
+## Glossary
+
+New to the terminology? See [`docs/GLOSSARY.md`](docs/GLOSSARY.md).
+
 ## License
 
 MIT — see `LICENSE`.
